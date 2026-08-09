@@ -82,6 +82,14 @@ func (r *reader) cloneMap() (map[string]any, error) {
 	return cloneMap(r.values)
 }
 
+/*
+需要真正的深拷贝（嵌套 map/slice 也要独立副本）
+数据结构完全由已知基础类型组成（string, int, float, bool, []any, map[string]any）
+已经 Register 了所有需要的类型
+不想引入第三方库（如 github.com/jinzhu/copier、github.com/mohae/deepcopy）
+对性能不敏感（配置加载等低频操作）
+*/
+
 func cloneMap(src map[string]any) (map[string]any, error) {
 	// https://gist.github.com/soroushjp/0ec92102641ddfc3ad5515ca76405f4d
 	var buf bytes.Buffer
@@ -157,6 +165,11 @@ func readValue(values map[string]any, path string) (Value, bool) {
 	return nil, false
 }
 
+/*
+这两个函数是 JSON 序列化/反序列化的统一适配层，核心目的是：
+让同一套代码同时兼容普通 Go 结构体和 Protobuf Message，且各自使用最合适的 JSON 库。
+*/
+
 func marshalJSON(v any) ([]byte, error) {
 	if m, ok := v.(proto.Message); ok {
 		return protojson.MarshalOptions{EmitUnpopulated: true}.Marshal(m)
@@ -165,6 +178,7 @@ func marshalJSON(v any) ([]byte, error) {
 }
 
 func unmarshalJSON(data []byte, v any) error {
+	// m 和 v 指向同一个底层对象
 	if m, ok := v.(proto.Message); ok {
 		return protojson.UnmarshalOptions{DiscardUnknown: true}.Unmarshal(data, m)
 	}

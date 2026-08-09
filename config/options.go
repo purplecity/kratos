@@ -111,6 +111,10 @@ func defaultResolver(input map[string]any) error {
 	return resolver(input, mapper, false)
 }
 
+/*
+Go 中匿名函数不能直接自引用（编译时 resolve 还未定义），所以必须先声明变量再赋值。这是 Go 实现递归闭包的标准写法。
+💡 也可以写成独立的具名函数，但闭包的好处是可以捕获外层的 mapper 和 toType 参数，避免每次递归都传递它们。
+*/
 func resolver(input map[string]any, mapper func(name string) string, toType bool) error {
 	var resolve func(map[string]any) error
 	resolve = func(sub map[string]any) error {
@@ -156,9 +160,11 @@ func mapper(input map[string]any) func(name string) string {
 }
 
 func convertToType(input string) any {
+	// 1. 检查：是否以 " 开头 且 以 " 结尾
 	// Check if the input is a string with quotes
 	if strings.HasPrefix(input, "\"") && strings.HasSuffix(input, "\"") {
 		// Trim the quotes and return the string value
+		// 2. 去掉首尾所有的 " 字符，返回结果
 		return strings.Trim(input, "\"")
 	}
 
@@ -187,6 +193,32 @@ func convertToType(input string) any {
 // placeholderRegexp matches ${...} placeholders in config value
 var placeholderRegexp = regexp.MustCompile(`\${(.*?)}`)
 
+/*
+FindAllStringSubmatch返回[][]string，每个子切片格式为：
+索引	含义
+[0]	完整匹配，如 ${DB_HOST}
+[1]	第一个捕获组，如 DB_HOST
+-1 表示匹配所有出现次数。
+
+| `toType` | 行为 | 返回值 |
+| :--- | :--- | :--- |
+| `true` | 找到第一个占位符就转换类型并立即返回 | `any`（可能是 bool/int/float/string） |
+| `false` | 遍历所有占位符，逐个做字符串替换 | `string`（替换后的完整字符串） |
+
+toType=false：字符串替换模式
+expand("${DB_HOST}:${DB_PORT}", mapping, false)
+
+	→ "localhost:5432" (string)
+
+toType=true：类型转换模式（仅第一个占位符）
+expand("${DB_PORT}", mapping, true)
+
+	→ int64(5432)
+
+expand("${DB_HOST}", mapping, true)
+
+	→ "localhost" (string，无法转为其他类型)
+*/
 func expand(s string, mapping func(string) string, toType bool) any {
 	re := placeholderRegexp.FindAllStringSubmatch(s, -1)
 	var ct any
