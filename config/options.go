@@ -90,6 +90,7 @@ func defaultDecoder(src *KeyValue, target map[string]any) error {
 		}
 		return nil
 	}
+	//target指向的是最内层
 	if codec := encoding.GetCodec(src.Format); codec != nil {
 		return codec.Unmarshal(src.Value, &target)
 	}
