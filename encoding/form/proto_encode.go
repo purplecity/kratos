@@ -169,6 +169,121 @@ func encodeMessage(msgDescriptor protoreflect.MessageDescriptor, value protorefl
 	}
 }
 
+// protoreflect 是 Protobuf 官方提供的纯反射 API。它的设计哲学是：完全脱离生成的 Go 结构体，仅通过元数据（Descriptor）和动态值（Value）来操作任何 Proto 消息。
+
+// 这对于框架开发者（如 Kratos）至关重要，因为框架不能提前 import 用户定义的所有 Message 类型。
+
+// 下面结合你贴的代码，逐一拆解这四个核心概念：
+
+// MessageDescriptor：消息的“蓝图/图纸”
+// 是什么：描述一个 Message 长什么样的只读元数据。包含消息名、字段列表、嵌套类型等。
+// 类比：数据库的表结构（Schema），或者 JSON Schema。
+// 代码中的体现：
+//         // 获取消息的完整限定名，用于判断是哪种 WKT
+//     msgDescriptor.FullName()
+//     // 输出: "google.protobuf.Timestamp", "google.protobuf.FieldMask" 等
+
+//     // 获取该消息下所有字段的描述符集合
+//     fd := msgDescriptor.Fields()
+
+// 关键点：它不包含任何实际数据，只包含结构定义。即使没有任何实例，你也能拿到 Descriptor。
+
+// FieldDescriptor：字段的“蓝图/图纸”
+// 是什么：描述单个字段元信息的只读对象。包含字段名、编号、类型、是否是 map/repeated 等。
+// 类比：表结构中某一列的定义（列名、数据类型、约束）。
+// 代码中的体现：
+//         // 通过字段名获取字段描述符
+//     fd := msgDescriptor.Fields().ByName("value")
+
+//     // 获取字段的 JSON 名称（proto3 中驼峰命名）
+//     fd.JSONName()   // 例如 "userName"
+
+//     // 获取字段的文本名称（通常是 snake_case）
+//     fd.TextName()   // 例如 "user_name"
+
+//     // 获取字段的类型种类
+//     fd.Kind()       // 返回 MessageKind, StringKind, Int32Kind 等
+
+// 关键点：ByName()、ByNumber()、ByJSONName() 是三种不同的查找方式。WKT 处理通常用 ByNumber()（最稳定），业务代码常用 ByName() 或 ByJSONName()。
+
+// Value：运行时的“动态数据容器”
+// 是什么：一个联合体（Union），封装了 Proto 中任意类型的运行时值。它可以是标量（int/string/bool）、Message、List 或 Map。
+// 类比：interface{} / any，但带有类型安全的方法集。
+// 代码中的体现：
+//         // 从 Message 中按字段描述符取出值
+//     v := value.Message().Get(fd.ByName("value"))
+
+//     // 将 Value 转为 Go 原生 interface{}，再 fmt.Sprint
+//     fmt.Sprint(v.Interface())
+
+//     // 如果知道值是 Message 类型，提取为 protoreflect.Message
+//     value.Message()
+
+// ⚠️ 核心陷阱：Value 的方法（.Int(), .String(), .Message() 等）不做类型检查。如果你对一个 StringKind 的 Value 调用 .Int()，会直接 panic。必须先通过 FieldDescriptor.Kind() 确认类型，或使用 .Interface() 安全转换。
+
+// MessageKind：字段类型的“枚举标签”
+// 是什么：protoreflect.Kind 枚举的一个值，表示某个字段的类型是嵌套消息。
+// 为什么需要它：Proto 的字段类型分两大类：
+//     标量类型：Int32Kind, StringKind, BoolKind 等 → 直接读写
+//     复合类型：MessageKind, GroupKind → 需要进一步进入子消息操作
+// 代码中的体现：
+//         // 遍历字段时，先判断是不是 Message 类型
+//     if fd.Kind() == protoreflect.MessageKind {
+//         // 只有 MessageKind 才能安全调用 fd.Message() 获取子消息的 Descriptor
+//         if msg := fd.Message(); msg.FullName() == fieldMaskFullName {
+//             // ... 处理 FieldMask
+//         }
+//     }
+
+// 关键点：这是类型分发的前置守卫。不对 Kind 做判断就直接操作 Value，是 protoreflect 新手最常见的 panic 来源。
+
+// 📌 四者关系一图流
+
+// ┌─────────────────────────────────────────────────────┐
+// │              MessageDescriptor (蓝图)                │
+// │  FullName(): "mypackage.UserRequest"                 │
+// │                                                      │
+// │  Fields() ──→ FieldDescriptor[]                      │
+// │               ├── Name: "user_name"                  │
+// │               ├── Kind: MessageKind ◄── 类型标签      │
+// │               ├── Number: 1                          │
+// │               └── Message() ──→ MessageDescriptor    │
+// │                   (子消息的蓝图，递归)                  │
+// └─────────────────────────────────────────────────────┘
+//                       ↕ Get/Set
+// ┌─────────────────────────────────────────────────────┐
+// │              Value (运行时数据)                       │
+// │  .Message() ──→ protoreflect.Message                 │
+// │  .Int()     ──→ int64                                │
+// │  .String()  ──→ string                               │
+// │  .Interface()──→ any (安全兜底)                       │
+// └─────────────────────────────────────────────────────┘
+
+// 💡 回到你的代码：完整执行流程
+
+// 以 EncodeFieldMask 为例，串起四个概念：
+
+// m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+//     // ① 用 FieldDescriptor.Kind 判断类型
+//     if fd.Kind() == protoreflect.MessageKind {
+
+//         // ② 用 FieldDescriptor.Message() 获取子消息的 MessageDescriptor
+//         if msg := fd.Message(); msg.FullName() == fieldMaskFullName {
+
+//             // ③ 把 Value + MessageDescriptor 传给 encodeMessage
+//             value, err := encodeMessage(msg, v)
+
+//             // ④ 用 FieldDescriptor.JSONName() 获取输出用的 key 名
+//             query = fd.JSONName() + "=" + value
+//         }
+//     }
+//     return true
+// })
+
+// 记忆口诀：Descriptor 是图纸（只读元数据），Value 是砖块（运行时数据），Kind 是分类标签（决定怎么搬砖），Message 是既能当图纸又能当砖块的复合体。
+
+// 掌握这四个概念后，你就具备了不依赖任何生成代码、纯动态操作任意 Proto 消息的能力。这也是所有 Proto 框架（gRPC-Gateway、Buf、Connect 等）底层实现的基石。
+
 // EncodeFieldMask return field mask name=paths
 func EncodeFieldMask(m protoreflect.Message) (query string) {
 	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {

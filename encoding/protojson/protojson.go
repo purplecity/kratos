@@ -9,6 +9,7 @@ import (
 	"github.com/go-kratos/kratos/v3/encoding"
 )
 
+// protojson = 让 HTTP 接口自动具备 "JSON 进、Proto 出" 和 "Proto 进、JSON 出" 的能力，使你的业务代码与传输格式彻底解耦。
 // Name is the name registered for the protojson codec.
 const Name = "protojson"
 

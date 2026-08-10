@@ -327,6 +327,46 @@ func parseMessage(md protoreflect.MessageDescriptor, value string) (protoreflect
 	default:
 		return protoreflect.Value{}, fmt.Errorf("unsupported message type: %q", string(md.FullName()))
 	}
+
+	/*
+			你说得完全正确，本质上就是 具体结构体 → 反射接口 → Value容器 的两次类型转换。
+
+		之所以不能一步到位，是因为 Go 的类型系统和 protoreflect API 的设计决定了必须经过中间层：
+
+		为什么不能直接 ValueOfMessage(msg)？
+
+		因为 ValueOfMessage 的函数签名是：
+
+		func ValueOfMessage(v protoreflect.Message) Value
+
+		它只接受 protoreflect.Message 接口，不接受 proto.Message 接口，更不接受具体的 *timestamppb.Timestamp。
+
+		而 msg 的类型是 proto.Message（或具体指针），这两个接口在 Go 中是完全不同的类型，没有隐式转换关系：
+		接口   定义位置   核心方法   语义
+		proto.Message   google.golang.org/protobuf/proto   ProtoReflect() protoreflect.Message   "我是一个 Proto 消息，我能提供反射视图"
+
+		protoreflect.Message   google.golang.org/protobuf/reflect/protoreflect   Get/Set/Range/Descriptor...   "我是纯反射操作接口，不依赖任何生成代码"
+
+		所以 .ProtoReflect() 不是多余的步骤，它是 proto.Message 向 protoreflect.Message 转换的唯一合法通道。
+
+		完整的转换链条
+
+		*timestamppb.Timestamp          ← 具体生成类型（构造 WKT 必须用它）
+		        │
+		        │ .ProtoReflect()       ← proto.Message 接口的方法
+		        ▼
+		protoreflect.Message            ← 纯反射接口（擦除具体类型）
+		        │
+		        │ ValueOfMessage()      ← 装入联合体容器
+		        ▼
+		protoreflect.Value              ← 统一返回值，供上层 Set() 使用
+
+		💡 你的直觉是对的
+
+		从数据层面看，确实没有任何拷贝或序列化发生。.ProtoReflect() 只是返回了一个指向同一块内存的反射视图（通常是一个轻量级的 wrapper struct），ValueOfMessage() 也只是把这个接口值塞进了一个 union 里。全程零拷贝，纯粹是类型系统层面的适配。
+
+		这种设计是刻意的：protoreflect 包被设计为完全不 import proto 包，以避免循环依赖。两个包之间唯一的桥梁就是 ProtoReflect() 这个方法。所以你看到的这两步转换，实际上是跨包边界通信的必经之路。
+	*/
 	return protoreflect.ValueOfMessage(msg.ProtoReflect()), nil
 }
 
