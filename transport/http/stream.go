@@ -26,6 +26,53 @@ import (
 	"github.com/go-kratos/kratos/v3/transport"
 )
 
+/*
+x1e 是 ASCII 控制字符中的 RS (Record Separator，记录分隔符)，其十进制值为 30。
+
+为什么选它？
+
+在 WebSocket 自定义协议/帧格式中，选择 x1e 作为控制消息前缀有以下几个实际考量：
+
+不会与正常文本/JSON 数据冲突
+    x1e 是一个不可打印的控制字符，在正常的 UTF-8 文本、JSON、XML 等业务数据中几乎不可能出现。因此用它做"控制帧 vs 数据帧"的分界标识非常安全，不需要额外的转义机制。
+
+语义上就是"分隔符"
+    ASCII 定义了 4 个层级分隔符：
+十六进制   名称   含义
+x1c   FS   File Separator（文件分隔）
+
+x1d   GS   Group Separator（组分隔）
+
+x1e   RS   Record Separator（记录分隔）
+
+x1f   US   Unit Separator（单元分隔）
+
+    这里用 RS 表示"这是一条控制记录"，语义上是自洽的。
+
+单字节，解析高效
+    只需要检查第一个字节是否为 0x1e 就能判断消息类型，O(1) 复杂度，无需扫描或匹配多字节序列。
+
+行业惯例
+    这种用法并非独创。SignalR（微软的实时通信框架）在其 WebSocket 传输协议中就使用 x1e 作为消息分隔符；许多自定义二进制/混合协议也选用 ASCII 控制字符作为帧标记。你贴的代码风格与 SignalR 的 WebSocket 控制协议高度一致。
+
+代码逻辑解读
+
+websocketControlPrefix = "x1e"           // 控制消息标识
+websocketControlEnd    = "x1eend"       // 连接正常结束信号
+websocketControlError  = "x1eerror:"    // 错误信号，后跟错误描述
+
+收到 WebSocket 消息时，解析逻辑大致为：
+if strings.HasPrefix(msg, websocketControlPrefix) {
+    // 这是控制消息，不是业务数据
+    if msg == websocketControlEnd { ... }
+    if strings.HasPrefix(msg, websocketControlError) { ... }
+} else {
+    // 正常业务消息
+}
+
+一句话总结：x1e 就是一个"绝对不会出现在正常业务数据里的单字节标记"，用来零歧义地区分控制消息和数据消息，兼顾了安全性、性能和语义清晰。
+*/
+
 const (
 	sseContentType = "text/event-stream"
 

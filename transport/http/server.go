@@ -264,6 +264,74 @@ func (s *Server) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	s.Handler.ServeHTTP(res, req)
 }
 
+/*
+在 Kratos 的 HTTP Server 中，filter() 方法虽然名字容易与 FilterFunc（HTTP 过滤器链）混淆，但它实际上是一个 mux.MiddlewareFunc，被注册到 gorilla/mux 路由器的中间件栈中。
+
+它的核心意义是：作为每个请求进入业务处理前的"基础设施层"，负责构建 Kratos 统一的传输层上下文（Transport Context）。
+
+具体来说，它做了以下三件关键事情：
+
+统一管理请求超时
+if s.timeout > 0 {
+    ctx, cancel = context.WithTimeout(req.Context(), s.timeout)
+} else {
+    ctx, cancel = context.WithCancel(req.Context())
+}
+defer cancel()
+
+如果配置了 Timeout，则为每个请求创建带超时的 context，防止慢请求无限占用资源。
+即使没有配置超时，也创建一个可取消的 context，确保请求结束时能正确释放资源。
+注意：这个超时是 Kratos 框架层面的，独立于 http.Server.ReadTimeout/WriteTimeout，作用于整个中间件+业务处理链路。
+
+提取路径模板
+pathTemplate := req.URL.Path
+if route := mux.CurrentRoute(req); route != nil {
+    pathTemplate, _ = route.GetPathTemplate()
+}
+
+将 /users/123/orders/456 这样的具体路径还原为 /users/{id}/orders/{oid} 这样的模板形式。
+这个模板后续会作为 operation 字段写入 Transport，用于日志、监控指标聚合、链路追踪等场景（避免高基数问题）。
+
+构建并注入 Transport 上下文 ⭐️ 最核心的作用
+tr := &Transport{
+    operation:    pathTemplate,
+    pathTemplate: pathTemplate,
+    reqHeader:    headerCarrier(req.Header),   // ← 你之前问的 headerCarrier
+    replyHeader:  headerCarrier(w.Header()),
+    request:      req,
+    response:     w,
+}
+tr.request = req.WithContext(transport.NewServerContext(ctx, tr))
+next.ServeHTTP(w, tr.request)
+
+这里完成了 Kratos 框架抽象的关键一步：
+组件   作用
+headerCarrier(req.Header)   将 http.Header 包装为满足 transport.Header 接口的类型，使中间件可以统一读写请求头
+
+headerCarrier(w.Header())   同理包装响应头，让中间件能在业务处理前/后操作响应头
+
+transport.NewServerContext   将 Transport 嵌入 context，使得任何下游代码都可以通过 transport.FromServerContext(ctx) 获取传输层信息
+
+为什么叫 "filter" 而不是 "middleware"？
+
+这是历史命名遗留。在 Kratos 的设计中：
+FilterFunc = 纯 HTTP 层面的过滤器（类似 net/http middleware），通过 FilterChain 包裹在最外层
+filter() 返回的 mux.MiddlewareFunc = 框架内部的上下文构建器，运行在 mux 路由匹配之后、业务 handler 之前
+
+执行顺序实际上是：
+请求进入
+  → FilterChain (s.filters...)        ← 用户自定义 HTTP 过滤器
+    → mux.Router
+      → filter() (本函数)             ← 构建 Transport 上下文
+        → 路由匹配的 Handler          ← 业务逻辑
+
+与你之前问题的关联
+
+这正是 headerCarrier 存在的意义所在。filter() 需要将原始的 http.Header 适配成 Kratos 的 transport.Header 接口，而 headerCarrier 就是那个适配器。这样 Kratos 的中间件体系就可以完全不依赖 net/http，实现传输协议无关的设计——同一套中间件既能用于 HTTP Server，也能用于 gRPC Server。
+
+一句话总结：filter() 是 Kratos HTTP Server 的"上下文工厂"，它将原始的 HTTP 请求转化为框架统一的 Transport 抽象，使上层的中间件、日志、监控等基础设施能够以协议无关的方式工作。
+*/
+
 func (s *Server) filter() mux.MiddlewareFunc {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -296,6 +364,64 @@ func (s *Server) filter() mux.MiddlewareFunc {
 				tr.endpoint = s.endpoint.String()
 			}
 			tr.request = req.WithContext(transport.NewServerContext(ctx, tr))
+
+			/*
+							没错，确实互相循环了，但这在 Go 中完全没有问题。
+
+				让我用最直白的方式解释为什么"循环引用 ≠ 内存泄漏"：
+
+				你的担忧本质上是 Python/C++ 的思维
+
+				在引用计数 GC 的语言中：
+				tr 引用 req → req 引用数 +1
+				req(通过ctx) 引用 tr → tr 引用数 +1
+				→ 两者引用数永远 ≥ 1 → 永远无法释放 → 💥 内存泄漏
+
+				Go 的 GC 根本不数引用
+
+				Go 用的是 Mark-and-Sweep，它的逻辑是：
+
+				"从所有活跃变量（goroutine 栈、全局变量等）出发，能走到的对象就是活的；走不到的，不管内部怎么互指，全部回收。"
+
+				请求处理完毕后的状态：
+
+				GC Root (goroutine stack, globals...)
+				       │
+				       ✗ 没有任何路径指向 tr
+				       ✗ 没有任何路径指向 req
+				       ✗ 没有任何路径指向 ctx
+
+				    ┌──────────────────────┐
+				    │  tr ←→ req ←→ ctx   │  ← 三者互相引用
+				    │  (孤岛，不可达)       │
+				    └──────────────────────┘
+				         ↓
+				      整体回收 ✅
+
+				关键点：GC 不关心环内有多少条边，只关心从 Root 能不能到达这个环。 请求结束后，整个环变成孤岛，一次 GC 就全部清掉。
+
+				这不是 Kratos 的特殊设计，而是 Go HTTP 的标准范式
+
+				标准库自己的 middleware 模式也是这么做的：
+
+				// net/http 官方推荐写法
+				func authMiddleware(next http.Handler) http.Handler {
+				    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				        user := authenticate(r)
+				        // r.WithContext 把 user 塞进 context
+				        // context 挂在 r 上
+				        // 如果 user 里又存了 r → 同样的环
+				        ctx := context.WithValue(r.Context(), userKey, user)
+				        next.ServeHTTP(w, r.WithContext(ctx))
+				    })
+				}
+
+				Go 社区十几年来一直这么写，从未因此出过内存泄漏。
+
+				一句话总结
+
+				循环引用在引用计数语言里是 bug，在 Mark-and-Sweep 语言里是正常数据结构。 Go 属于后者，tr ↔ req ↔ ctx 的环在请求结束后变为不可达孤岛，会被 GC 完整回收，不存在任何问题。
+			*/
 			next.ServeHTTP(w, tr.request)
 		})
 	}

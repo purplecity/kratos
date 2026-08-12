@@ -111,6 +111,7 @@ type headerCarrier http.Header
 
 // Get returns the value associated with the passed key.
 func (hc headerCarrier) Get(key string) string {
+	//类型转换
 	return http.Header(hc).Get(key)
 }
 
